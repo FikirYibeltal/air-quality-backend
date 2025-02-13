@@ -1,7 +1,10 @@
 import { Response } from 'express';
 import { parse } from 'csv-parse';
 import fs from 'fs';
+import { Transform } from 'stream';
 import AirQualityUCI from '../../utls/database/models/airQualityUCI';
+
+const BATCH_SIZE = 1000;
 
 export function ingestDataController(req: any, res: Response): any {
   let filePath = '';
@@ -9,10 +12,12 @@ export function ingestDataController(req: any, res: Response): any {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
     filePath = req.file.path;
-    const results: any[] = [];
-    fs.createReadStream(filePath)
-      .pipe(parse({ delimiter: ';', from_line: 2 } as any))
-      .on('data', (row: any) => {
+    let batch: any[] = [];
+
+    const transform = new Transform({
+      objectMode: true,
+      transform(chunk, encoding, callback) {
+        const row = chunk;
         if (row[0] && row[1]) {
           const cleanedRow = {
             date: row[0].split('/').reverse().join('-'),
@@ -31,20 +36,53 @@ export function ingestDataController(req: any, res: Response): any {
             humidity: parseFloat(row[13].replace(',', '.')),
             absolute_humidity: parseFloat(row[14].replace(',', '.')),
           };
-          results.push(cleanedRow);
+          this.push(cleanedRow);
         }
-      })
-      .on('end', async () => {
+        callback();
+      },
+    });
+
+    const saveBatch = async () => {
+      if (batch.length > 0) {
+        await AirQualityUCI.bulkCreate(batch);
+        batch = [];
+      }
+    };
+
+    const stream = fs.createReadStream(filePath)
+      .pipe(parse({ delimiter: ';', from_line: 2 } as any))
+      .pipe(transform);
+
+    stream.on('data', async (data) => {
+      batch.push(data);
+      if (batch.length >= BATCH_SIZE) {
+        stream.pause();
         try {
-          await AirQualityUCI.bulkCreate(results);
-          fs.unlinkSync(filePath);
-          res.status(200).json({ message: 'Data successfully ingested!' });
+          await saveBatch();
+          console.log('batch saved');
+          stream.resume();
         } catch (err: any) {
-          res.status(500).json({ error: err.message });
+          stream.destroy(err);
         }
-      });
+      }
+    });
+
+    stream.on('end', async () => {
+      try {
+        await saveBatch();
+        fs.unlinkSync(filePath);
+        res.status(200).json({ message: 'Data successfully ingested!' });
+      } catch (err: any) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    stream.on('error', (err) => {
+      if (filePath) fs.unlinkSync(filePath);
+      res.status(500).json({ error: err.message });
+    });
   } catch (err: any) {
-    if(filePath) fs.unlinkSync(filePath);
+    if (filePath) fs.unlinkSync(filePath);
     res.status(500).json({ error: err.message });
   }
 }
