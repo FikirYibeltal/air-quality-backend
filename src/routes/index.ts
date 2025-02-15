@@ -13,7 +13,7 @@ router.get('/health', healthController);
 
 router.post('/ingestData', upload.single('file'), ingestDataController);
 
-router.post('/search', searchController);
+router.post('/searchData', searchController);
 
 router.use('*', notFoundController);
 
